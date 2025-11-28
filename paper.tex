@@ -1,0 +1,144 @@
+\documentclass[11pt, a4paper]{article}
+
+% --- UNIVERSAL PREAMBLE BLOCK ---
+\usepackage[a4paper, top=2.5cm, bottom=2.5cm, left=2cm, right=2cm]{geometry}
+\usepackage{fontspec}
+\usepackage[english, bidi=basic, provide=*]{babel}
+\babelprovide[import, onchar=ids fonts]{english}
+\babelfont{rm}{Noto Sans}
+\usepackage{enumitem}
+\setlist[itemize]{label=-}
+
+% --- PACKAGES ---
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+
+% --- ENVIRONMENT DEFINITIONS ---
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{remark}{Remark}[section]
+
+\title{The Spectral Foundations of Deep Equilibrium Models: \\ From Discrete Depth to Geometric Stability}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section{Theoretical Framework}
+\label{sec:theory}
+
+In this section, we formalize the conditions under which the Deep Equilibrium Model (DEQ) map is well-defined and differentiable. We explicitly separate the algebraic sufficient condition for gradient existence (non-singularity) from the stronger geometric condition for forward-pass convergence (contractivity), identifying the spectral radius as the central control parameter for both.
+
+\subsection{Formal Setup and Definitions}
+
+Let the DEQ transition function be $f: \mathcal{Z} \times \mathcal{X} \times \Theta \to \mathcal{Z}$, where $\mathcal{Z} \subseteq \mathbb{R}^D$ is the hidden state space, $\mathcal{X} \subseteq \mathbb{R}^M$ is the input space, and $\Theta \subseteq \mathbb{R}^P$ is the parameter space.
+
+The \textbf{equilibrium condition} is defined by the root-finding problem $G(z, x, \theta) = 0$, where the residual map is:
+\begin{equation}
+    G(z, x, \theta) := f(z, x, \theta) - z
+\end{equation}
+We define the \textbf{State Jacobian} $J_f$ evaluated at a specific equilibrium configuration $(\bar{z}, \bar{x}, \bar{\theta})$ as:
+\begin{equation}
+    J_f := \frac{\partial f}{\partial z}\bigg|_{\bar{z}, \bar{x}, \bar{\theta}}
+\end{equation}
+
+\subsection{Local Differentiability and Gradient Existence}
+
+A sufficient condition for the implicit map to be differentiable is algebraic non-degeneracy, derived from the Implicit Function Theorem.
+
+\textbf{Hypotheses:}
+\begin{itemize}
+    \item \textbf{H1 (Regularity):} The sets $\mathcal{Z}, \mathcal{X}, \Theta$ are open subsets of Euclidean space, and $f$ is continuously differentiable ($\mathcal{C}^1$).
+    \item \textbf{H2 (Existence):} There exists an equilibrium $\bar{z}$ such that $G(\bar{z}, \bar{x}, \bar{\theta}) = 0$. We treat existence as a modeling assumption: training procedures (e.g., spectral regularization and root-finding stopping criteria) ensure the solver returns a numerical fixed point for the current parameters.
+    \item \textbf{H3 (Non-Degeneracy):} The matrix $(I - J_f)$ is non-singular. This is equivalent to the condition that $1$ is not an eigenvalue of the Jacobian: $1 \notin \sigma(J_f)$.
+\end{itemize}
+
+\begin{theorem}[Fundamental Theorem of DEQ Differentiability]
+\label{thm:ift}
+Under Hypotheses \textbf{H1, H2,} and \textbf{H3}, the equilibrium $\bar{z}$ locally defines a unique, continuously differentiable function $z^*(x, \theta)$ in a neighborhood of $(\bar{x}, \bar{\theta})$. The gradients required for backpropagation at this point are given analytically by:
+\begin{equation}
+    \frac{\partial z^*}{\partial x}(\bar{x}, \bar{\theta}) = \left( I - J_f(\bar{z}, \bar{x}, \bar{\theta}) \right)^{-1} D_x f(\bar{z}, \bar{x}, \bar{\theta})
+\end{equation}
+and similarly for $\theta$. Note that these analytic gradients depend only on the fixed point $\bar{z}$ and are independent of the number of solver iterations used to find it.
+\end{theorem}
+
+\begin{proof}
+The proof follows directly from the Implicit Function Theorem (IFT). H1 and H2 satisfy the regularity and root requirements. H3 ensures that the Jacobian of the residual with respect to the dependent variable, $J_G = J_f - I$, is invertible. Thus, the IFT guarantees the local existence and $\mathcal{C}^1$ smoothness of the map $z^*(x, \theta)$ and yields the explicit formulas via implicit differentiation.
+\end{proof}
+
+\subsection{Spectral Stability and Convergence}
+
+While H3 is sufficient for differentiation, practical training requires the stronger condition of stability to ensure the forward solver converges.
+
+\begin{corollary}[Stability Implies Differentiability]
+\label{cor:stability}
+Assume H1 and H2 hold. If the \textbf{spectral radius} $\Phi$ of the State Jacobian is strictly less than 1:
+\begin{equation}
+    \Phi = \rho(J_f(\bar{z}, \bar{x}, \bar{\theta})) < 1
+\end{equation}
+Then:
+\begin{enumerate}
+    \item \textbf{Differentiability:} H3 is automatically satisfied (since $|\lambda_i| < 1 \implies \lambda_i \neq 1$), which is sufficient for gradient existence via Theorem \ref{thm:ift}.
+    \item \textbf{Local Stability:} The equilibrium $\bar{z}$ is \textbf{locally asymptotically stable} for the discrete-time system $z_{k+1} = f(z_k)$.
+    \item \textbf{Contractivity:} There exists a neighborhood $\mathcal{B}$ of $\bar{z}$ and an induced vector norm $\|\cdot\|_*$ such that $f$ is a \textbf{strict contraction} on $\mathcal{B}$. Consequently, the fixed-point iteration converges to $\bar{z}$ from any initialization in $\mathcal{B}$.
+\end{enumerate}
+\end{corollary}
+
+\begin{proof}
+Statement 1 follows directly from spectral properties. Statement 2 follows from the linearization stability theorem: if the Jacobian of the update map has eigenvalues strictly inside the unit circle, the fixed point is locally asymptotically stable. For Statement 3, we invoke \textbf{Gelfand’s Formula}. Since $\rho(J_f) < 1$, and since all norms on finite-dimensional vector spaces are equivalent, there exists a matrix norm $\|\cdot\|_*$ such that $\|J_f(\bar{z})\|_* < 1$. Since the spectral radius is upper semicontinuous with respect to matrix entries, this bound holds in a neighborhood $\mathcal{B}$. The Mean Value Inequality implies $f$ is a contraction in this norm, and the Banach Fixed-Point Theorem guarantees uniqueness and convergence.
+\end{proof}
+
+\begin{remark}
+The condition $\rho(J_f)<1$ is sufficient but not necessary for differentiability. Equilibria with $1\in\sigma(J_f)$ may admit generalized derivatives, but their treatment lies beyond the present scope.
+\end{remark}
+
+\paragraph{Numerical Solvers.}
+In practice $z^*$ is approximated by a finite number of fixed-point iterations. This does not alter the analytic derivative formula; backpropagation is performed via implicit differentiation at the converged iterate.
+
+\section{Discussion: Deep Learning as a Geometric Equilibrium Problem}
+\label{sec:discussion}
+
+\begin{figure}[htbp]
+    \centering
+    \framebox{\parbox{0.8\textwidth}{\centering
+        \vspace{2cm}
+        \textbf{[Schematic of Spectral Phase Transition]} \\
+        \small\textit{Diagram showing regimes: Contractive ($\Phi<1$), Critical ($\Phi \approx 1$), Divergent ($\Phi>1$).}
+        \vspace{2cm}
+    }}
+    \caption{\textbf{Schematic of the Spectral Phase Transition.} As the spectral radius $\Phi$ increases, the system moves from a contractive regime ($\Phi < 1$, stable convergence), to a critical regime ($\Phi \approx 1$, maximal sensitivity), to a divergent regime ($\Phi > 1$). Our $\Phi$-regularization explicitly targets the critical boundary to maximize expressivity while maintaining stability.}
+    \label{fig:phase_transition}
+\end{figure}
+
+The theoretical results in Section \ref{sec:theory} suggest a fundamental shift in how we conceptualize deep learning. By moving from explicit layer stacks to implicit fixed points, we transition from a paradigm of \textit{sequential computation} to one of \textit{geometric equilibrium}.
+
+\subsection{The Ontological Shift: From Implementation to Law}
+Standard deep learning defines a model via its execution path: a sequence of discrete transformations $z_{k+1} = f_k(z_k)$. In this view, ``depth'' is a structural parameter. Our analysis frames the DEQ not as an infinite limit of this process, but as the solution to a functional equation $z^* = f_\theta(z^*, x)$.
+
+This distinction is ontological. The DEQ is not defined by \textit{how} it is computed, but by the \textbf{steady-state law} it satisfies.
+\begin{itemize}
+    \item \textbf{Depth is an implementation artifact:} The number of solver iterations $N$ is merely a computational detail governed by error tolerance.
+    \item \textbf{Complexity is governed by spectral geometry:} In DEQs, the effective complexity of the mapping is not determined by layer counts, but by the stability regime of the operator $f_\theta$, as captured, for example, by the local sensitivity of the equilibrium mapping $(I-J_f)^{-1}$.
+\end{itemize}
+
+\subsection{Expressivity as Phase Transition}
+If depth is no longer the driver of representational power, what is? Our analysis identifies the \textbf{spectral radius} $\Phi$ as the control parameter for a dynamical phase transition (see Figure \ref{fig:phase_transition}):
+\begin{itemize}
+    \item $\mathbf{\Phi < 1}$ \textbf{(Contraction / Order):} The system is in a stable basin of attraction. This guarantees convergence but, if $\Phi \ll 1$, risks collapsing representations into low-entropy states.
+    \item $\mathbf{\Phi > 1}$ \textbf{(Expansion / Divergence):} The system is unstable. Perturbations amplify exponentially, leading to solver divergence.
+    \item $\mathbf{\Phi \approx 1}$ \textbf{(Criticality):} The system sits at the phase transition. Here, the fixed-point manifold exhibits maximal differential curvature and sensitivity to input $x$.
+\end{itemize}
+
+\textbf{Expressivity emerges from this criticality.} High-frequency response and complex mode multiplicity are products of tuning the operator to maintain the equilibrium state near the critical surface without crossing into chaos. Importantly, the critical regime $\Phi \approx 1$ is a training target, not a runtime requirement. In our experiments (Section \ref{sec:experiments}), we operationalize this by explicitly tracking $\hat{\Phi}$ and demonstrating that models trained to operate near (but below) $\Phi=1$ achieve both stable convergence and richer equilibrium geometry.
+
+\subsection{The New Role: Manifold Engineering}
+This perspective redefines the role of the deep learning practitioner. The \textit{Architect} designs discrete layer stacks; the \textit{Manifold Engineer} sculpts continuous vector fields. Training a $\Phi$-regularized DEQ is the act of shaping the vector field $V(z) = f(z, x) - z$ such that its roots lie in desirable regions of the state space (via Manifold Repulsion) and possess specific local attractive properties (via Spectral Control). We are solving an inverse problem in dynamical systems design: finding a parameterization $\theta$ that induces a specific equilibrium topology, subject to data supervision.
+
+\subsection{Principled Spectral Constraints}
+Finally, we emphasize that this framework grounds stabilization techniques in provable spectral constraints rather than ad-hoc architectural tricks. By adhering to the constraints of the \textbf{Implicit Function Theorem} and the \textbf{Banach Fixed-Point Theorem}, we replace empirical heuristics with a rigorous discipline of spectral conditioning. Note that while $\Phi$ controls dynamical stability, we often compute bounds on the operator norm $\|J_f\|_2$ in practice (e.g., via Power Iteration), as this provides a tractable, differentiable upper bound for the spectral radius.
+
+\end{document}
