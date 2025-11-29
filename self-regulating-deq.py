@@ -428,6 +428,27 @@ def train_multi_deq_pde(
         
         # Record validation
         tracker.record_val(global_step, loss=val_loss)
+        
+        # Store PDE field snapshot (one sample per epoch for visualization)
+        with torch.no_grad():
+            sample_x, sample_y = val_ds[0]
+            sample_x = sample_x.unsqueeze(0).to(device)
+            sample_y = sample_y.unsqueeze(0).to(device)
+            
+            boundary, mask = sample_x[:, :1], sample_x[:, 1:2]
+            alpha = model.block.stabilizer(boundary, mask)
+            gamma = model.block.spec_ctrl(boundary, mask)
+            pred = model(sample_x)
+            
+            tracker.store_snapshot(
+                step=global_step,
+                boundary=boundary[0, 0].cpu().numpy(),
+                mask=mask[0, 0].cpu().numpy(),
+                prediction=pred[0, 0].cpu().numpy(),
+                target=sample_y[0, 0].cpu().numpy(),
+                alpha=alpha[0, 0].cpu().numpy(),
+                gamma=gamma.mean().item(),
+            )
 
         print(f"[3DEQ] Epoch {epoch:02d} | train_mse={train_loss:.6f} | "
               f"val_mse={val_loss:.6f} | phi≈{avg_phi:.3f} | "

@@ -608,6 +608,27 @@ def train_ccs_multi_deq(
         
         # Record validation
         tracker.record_val(global_step, loss=val_loss)
+        
+        # Store PDE field snapshot (one sample per epoch for visualization)
+        with torch.no_grad():
+            sample_x, sample_y = val_ds[0]
+            sample_x = sample_x.unsqueeze(0).to(device)
+            sample_y = sample_y.unsqueeze(0).to(device)
+            
+            boundary, mask, k, Q = sample_x[:, :1], sample_x[:, 1:2], sample_x[:, 2:3], sample_x[:, 3:4]
+            alpha = model.block.stabilizer(boundary, mask, k, Q)
+            gamma = model.block.spec_ctrl(boundary, mask, k, Q)
+            pred = model(sample_x)
+            
+            tracker.store_snapshot(
+                step=global_step,
+                permeability=k[0, 0].cpu().numpy(),
+                injection=Q[0, 0].cpu().numpy(),
+                prediction=pred[0, 0].cpu().numpy(),
+                target=sample_y[0, 0].cpu().numpy(),
+                alpha=alpha[0, 0].cpu().numpy(),
+                gamma=gamma.mean().item(),
+            )
 
         print(f"[CCS-DEQ] Epoch {epoch:02d}/{n_epochs} | train_mse={train_loss:.4f} | "
               f"val_mse={val_loss:.4f} | φ≈{avg_phi:.3f} | α={avg_alpha:.3f} | γ={avg_gamma:.3f}")

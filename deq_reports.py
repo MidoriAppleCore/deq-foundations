@@ -70,6 +70,9 @@ class MetricsTracker:
     steps: List[int] = field(default_factory=list)
     val_steps: List[int] = field(default_factory=list)
     
+    # Image/field snapshot storage (for PDE problems)
+    _snapshots: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
+    
     def record(self, step: int, **kwargs):
         """Record arbitrary metrics for a training step."""
         self.steps.append(step)
@@ -117,6 +120,59 @@ class MetricsTracker:
         """Save metrics to npz file."""
         np.savez(filepath, **self.as_numpy())
         print(f"  ✓ Metrics saved to {filepath}")
+    
+    # --------------------------------------------------------
+    # IMAGE/FIELD SNAPSHOT STORAGE (for PDE problems)
+    # --------------------------------------------------------
+    
+    def store_snapshot(self, step: int, **fields):
+        """
+        Store 2D field snapshots for visualization.
+        
+        Example for reservoir pressure:
+            tracker.store_snapshot(
+                step=step,
+                permeability=k[0,0].cpu().numpy(),
+                injection=Q[0,0].cpu().numpy(),
+                pressure=p[0,0].cpu().numpy(),
+                alpha=alpha[0,0].cpu().numpy(),
+                gamma=gamma.item(),
+                prediction=pred[0,0].cpu().numpy(),
+                target=target[0,0].cpu().numpy(),
+            )
+        """
+        if 'field_snapshots' not in self._snapshots:
+            self._snapshots['field_snapshots'] = []
+        
+        snapshot = {'step': step}
+        for key, value in fields.items():
+            # Handle PyTorch tensors
+            if hasattr(value, 'cpu') and hasattr(value, 'numpy'):
+                value = value.cpu().numpy()
+            # Handle numpy arrays - keep as is
+            elif isinstance(value, np.ndarray):
+                pass  # Already numpy, keep it
+            # Handle scalars (torch scalar or python number)
+            elif hasattr(value, 'item'):
+                try:
+                    value = value.item()
+                except (ValueError, RuntimeError):
+                    # Multi-element tensor/array, convert to numpy
+                    if hasattr(value, 'cpu'):
+                        value = value.cpu().numpy()
+                    elif hasattr(value, 'numpy'):
+                        value = value.numpy()
+            snapshot[key] = value
+        
+        self._snapshots['field_snapshots'].append(snapshot)
+    
+    def get_snapshots(self) -> List[Dict[str, Any]]:
+        """Get all stored field snapshots."""
+        return self._snapshots.get('field_snapshots', [])
+    
+    def has_snapshots(self) -> bool:
+        """Check if any snapshots exist."""
+        return len(self._snapshots.get('field_snapshots', [])) > 0
 
 
 # ============================================================
@@ -251,6 +307,20 @@ class ReportManager:
         if m.val_steps:
             self._plot_validation()
             generated.append("11_validation.png")
+        
+        # PDE Field Snapshots (if stored)
+        if m.has_snapshots():
+            self._plot_pde_field_evolution()
+            generated.append("12_pde_field_evolution.png")
+            
+            self._plot_pde_stabilizer_gallery()
+            generated.append("13_pde_stabilizer_gallery.png")
+            
+            self._plot_pde_error_maps()
+            generated.append("14_pde_error_maps.png")
+            
+            self._plot_pde_correlation_evolution()
+            generated.append("15_pde_correlation_evolution.png")
         
         # Save raw metrics
         self.tracker.save(f"{self.report_dir}/metrics.npz")
@@ -798,6 +868,390 @@ class ReportManager:
         plt.savefig(f'{self.report_dir}/11_validation.png', dpi=150, bbox_inches='tight')
         plt.close()
         print("  ✓ 11_validation.png")
+
+    # --------------------------------------------------------
+    # PDE FIELD VISUALIZATION METHODS
+    # --------------------------------------------------------
+    
+    def _plot_pde_field_evolution(self):
+        """Show evolution of PDE fields over training (input, prediction, target)."""
+        snapshots = self.tracker.get_snapshots()
+        if not snapshots:
+            return
+        
+        # Select evenly-spaced snapshots to show evolution
+        n_show = min(5, len(snapshots))
+        indices = np.linspace(0, len(snapshots)-1, n_show, dtype=int)
+        selected = [snapshots[i] for i in indices]
+        
+        # Detect what fields are available
+        sample = selected[0]
+        field_types = []
+        
+        # Input fields
+        if 'permeability' in sample:
+            field_types.append(('permeability', None, 'terrain', 'Log₁₀ Permeability k'))
+        if 'injection' in sample:
+            field_types.append(('injection', None, 'hot', 'CO₂ Injection Q'))
+        if 'boundary' in sample:
+            field_types.append(('boundary', None, 'coolwarm', 'Boundary Conditions'))
+        if 'mask' in sample:
+            field_types.append(('mask', None, 'gray', 'Domain Mask'))
+        
+        # Output fields
+        if 'prediction' in sample:
+            field_types.append(('prediction', 'pressure', 'viridis', 'Prediction'))
+        elif 'pressure' in sample:
+            field_types.append(('pressure', None, 'viridis', 'Pressure p(x,y)'))
+        if 'target' in sample:
+            field_types.append(('target', None, 'viridis', 'Target'))
+        
+        # Homeostatic fields
+        if 'alpha' in sample:
+            field_types.append(('alpha', None, 'plasma', 'Stabilizer α'))
+        
+        n_rows = len(field_types)
+        n_cols = n_show
+        
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4*n_cols, 3.5*n_rows))
+        fig.suptitle('PDE Field Evolution During Training', fontsize=14, fontweight='bold')
+        
+        if n_rows == 1:
+            axes = axes.reshape(1, -1)
+        if n_cols == 1:
+            axes = axes.reshape(-1, 1)
+        
+        for row, (field_key, alt_key, cmap, title_base) in enumerate(field_types):
+            for col, snap in enumerate(selected):
+                ax = axes[row, col]
+                
+                # Get field data
+                if field_key in snap:
+                    field = snap[field_key]
+                elif alt_key and alt_key in snap:
+                    field = snap[alt_key]
+                else:
+                    ax.text(0.5, 0.5, 'N/A', ha='center', va='center', transform=ax.transAxes)
+                    continue
+                
+                # Log scale for permeability
+                if field_key == 'permeability':
+                    field = np.log10(field + 1e-8)
+                
+                im = ax.imshow(field, cmap=cmap, aspect='auto')
+                if row == 0:
+                    ax.set_title(f'Step {snap["step"]}', fontsize=10)
+                if col == 0:
+                    ax.set_ylabel(title_base, fontsize=9)
+                plt.colorbar(im, ax=ax, fraction=0.046)
+                ax.set_xticks([])
+                ax.set_yticks([])
+        
+        plt.tight_layout()
+        plt.savefig(f'{self.report_dir}/12_pde_field_evolution.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        print("  ✓ 12_pde_field_evolution.png")
+    
+    def _plot_pde_stabilizer_gallery(self):
+        """Gallery of stabilizer α patterns with input correlation."""
+        snapshots = self.tracker.get_snapshots()
+        if not snapshots:
+            return
+        
+        sample = snapshots[0]
+        has_alpha = 'alpha' in sample
+        has_k = 'permeability' in sample
+        has_boundary = 'boundary' in sample
+        has_gamma = 'gamma' in sample
+        
+        if not has_alpha:
+            return
+        
+        # Select snapshots
+        n_show = min(6, len(snapshots))
+        indices = np.linspace(0, len(snapshots)-1, n_show, dtype=int)
+        selected = [snapshots[i] for i in indices]
+        
+        # Determine title based on problem type
+        if has_k:
+            title = 'Stabilizer α Evolution & Geological Intelligence'
+            corr_xlabel = 'Permeability k'
+            corr_label = 'ρ(k,α)'
+        elif has_boundary:
+            title = 'Stabilizer α Evolution & Boundary Awareness'
+            corr_xlabel = 'Boundary Value'
+            corr_label = 'ρ(BC,α)'
+        else:
+            title = 'Stabilizer α Evolution'
+            corr_xlabel = 'α value'
+            corr_label = ''
+        
+        fig = plt.figure(figsize=(16, 10))
+        fig.suptitle(title, fontsize=14, fontweight='bold')
+        
+        n_cols = n_show
+        
+        for col, snap in enumerate(selected):
+            # Top: alpha field
+            ax1 = fig.add_subplot(2, n_cols, col + 1)
+            alpha = snap['alpha']
+            im = ax1.imshow(alpha, cmap='plasma', vmin=0, vmax=1, aspect='auto')
+            ax1.set_title(f'Step {snap["step"]}', fontsize=10)
+            if col == 0:
+                ax1.set_ylabel('Stabilizer α', fontsize=10)
+            plt.colorbar(im, ax=ax1, fraction=0.046)
+            ax1.set_xticks([])
+            ax1.set_yticks([])
+            
+            # Bottom: correlation plot
+            ax2 = fig.add_subplot(2, n_cols, n_cols + col + 1)
+            alpha_flat = alpha.flatten()
+            gamma_val = snap.get('gamma', 0)
+            
+            if has_k:
+                k = snap['permeability']
+                k_flat = k.flatten()
+                ax2.scatter(k_flat, alpha_flat, alpha=0.3, s=8, c='darkblue')
+                ax2.set_xlabel(corr_xlabel)
+                corr = np.corrcoef(k_flat, alpha_flat)[0, 1] if len(k_flat) > 1 else 0
+                ax2.text(0.05, 0.95, f'{corr_label}={corr:.3f}\nγ={gamma_val:.3f}',
+                        transform=ax2.transAxes, fontsize=9, va='top',
+                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+            elif has_boundary:
+                boundary = snap['boundary']
+                b_flat = boundary.flatten()
+                # Filter for boundary points (non-zero boundary values)
+                nonzero = np.abs(b_flat) > 1e-6
+                if nonzero.sum() > 10:
+                    ax2.scatter(b_flat[nonzero], alpha_flat[nonzero], alpha=0.4, s=10, c='darkgreen')
+                    corr = np.corrcoef(b_flat[nonzero], alpha_flat[nonzero])[0, 1]
+                else:
+                    ax2.scatter(b_flat, alpha_flat, alpha=0.3, s=8, c='darkgreen')
+                    corr = np.corrcoef(b_flat, alpha_flat)[0, 1] if len(b_flat) > 1 else 0
+                ax2.set_xlabel(corr_xlabel)
+                ax2.text(0.05, 0.95, f'{corr_label}={corr:.3f}\nγ={gamma_val:.3f}',
+                        transform=ax2.transAxes, fontsize=9, va='top',
+                        bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
+            else:
+                ax2.hist(alpha_flat, bins=30, color='purple', alpha=0.7)
+                ax2.set_xlabel('α value')
+                ax2.text(0.05, 0.95, f'γ={gamma_val:.3f}',
+                        transform=ax2.transAxes, fontsize=9, va='top',
+                        bbox=dict(boxstyle='round', facecolor='lavender', alpha=0.8))
+            
+            if col == 0:
+                ax2.set_ylabel('α(x,y)')
+            ax2.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(f'{self.report_dir}/13_pde_stabilizer_gallery.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        print("  ✓ 13_pde_stabilizer_gallery.png")
+    
+    def _plot_pde_error_maps(self):
+        """Error maps showing where model struggles."""
+        snapshots = self.tracker.get_snapshots()
+        if not snapshots:
+            return
+        
+        # Need prediction and target
+        sample = snapshots[0]
+        has_pred = 'prediction' in sample or 'pressure' in sample
+        has_target = 'target' in sample
+        
+        if not (has_pred and has_target):
+            return
+        
+        # Select snapshots
+        n_show = min(4, len(snapshots))
+        indices = np.linspace(0, len(snapshots)-1, n_show, dtype=int)
+        selected = [snapshots[i] for i in indices]
+        
+        fig = plt.figure(figsize=(16, 12))
+        fig.suptitle('Prediction Error Analysis', fontsize=14, fontweight='bold')
+        
+        for col, snap in enumerate(selected):
+            pred = snap.get('prediction', snap.get('pressure'))
+            target = snap['target']
+            
+            # Error map
+            error = np.abs(pred - target)
+            rel_error = error / (np.abs(target) + 1e-8)
+            
+            # Row 1: Prediction
+            ax1 = fig.add_subplot(4, n_show, col + 1)
+            im1 = ax1.imshow(pred, cmap='viridis', aspect='auto')
+            ax1.set_title(f'Step {snap["step"]}', fontsize=10)
+            if col == 0:
+                ax1.set_ylabel('Prediction')
+            plt.colorbar(im1, ax=ax1, fraction=0.046)
+            ax1.set_xticks([]); ax1.set_yticks([])
+            
+            # Row 2: Target
+            ax2 = fig.add_subplot(4, n_show, n_show + col + 1)
+            im2 = ax2.imshow(target, cmap='viridis', aspect='auto')
+            if col == 0:
+                ax2.set_ylabel('Target')
+            plt.colorbar(im2, ax=ax2, fraction=0.046)
+            ax2.set_xticks([]); ax2.set_yticks([])
+            
+            # Row 3: Absolute Error
+            ax3 = fig.add_subplot(4, n_show, 2*n_show + col + 1)
+            im3 = ax3.imshow(error, cmap='hot', aspect='auto')
+            if col == 0:
+                ax3.set_ylabel('|Error|')
+            plt.colorbar(im3, ax=ax3, fraction=0.046)
+            ax3.set_xticks([]); ax3.set_yticks([])
+            
+            # MSE stats
+            mse = np.mean(error**2)
+            ax3.text(0.02, 0.98, f'MSE={mse:.4f}', transform=ax3.transAxes, fontsize=8,
+                    va='top', bbox=dict(facecolor='white', alpha=0.8))
+            
+            # Row 4: Relative Error
+            ax4 = fig.add_subplot(4, n_show, 3*n_show + col + 1)
+            im4 = ax4.imshow(np.clip(rel_error, 0, 1), cmap='hot', vmin=0, vmax=0.5, aspect='auto')
+            if col == 0:
+                ax4.set_ylabel('Rel Error')
+            plt.colorbar(im4, ax=ax4, fraction=0.046)
+            ax4.set_xticks([]); ax4.set_yticks([])
+        
+        plt.tight_layout()
+        plt.savefig(f'{self.report_dir}/14_pde_error_maps.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        print("  ✓ 14_pde_error_maps.png")
+    
+    def _plot_pde_correlation_evolution(self):
+        """Track how input-α correlation evolves during training."""
+        snapshots = self.tracker.get_snapshots()
+        if not snapshots:
+            return
+        
+        # Detect problem type
+        sample = snapshots[0]
+        has_k = 'permeability' in sample
+        has_boundary = 'boundary' in sample
+        
+        # Compute correlation for each snapshot
+        steps = []
+        correlations = []
+        gamma_vals = []
+        alpha_means = []
+        alpha_stds = []
+        
+        for snap in snapshots:
+            if 'alpha' not in snap:
+                continue
+            
+            alpha = snap['alpha']
+            steps.append(snap['step'])
+            alpha_means.append(np.mean(alpha))
+            alpha_stds.append(np.std(alpha))
+            
+            if 'gamma' in snap:
+                gamma_vals.append(snap['gamma'])
+            
+            # Compute correlation based on problem type
+            if has_k and 'permeability' in snap:
+                k = snap['permeability']
+                corr = np.corrcoef(k.flatten(), alpha.flatten())[0, 1]
+                correlations.append(corr)
+            elif has_boundary and 'boundary' in snap:
+                boundary = snap['boundary']
+                b_flat = boundary.flatten()
+                alpha_flat = alpha.flatten()
+                # For boundary, focus on boundary points
+                nonzero = np.abs(b_flat) > 1e-6
+                if nonzero.sum() > 10:
+                    corr = np.corrcoef(b_flat[nonzero], alpha_flat[nonzero])[0, 1]
+                else:
+                    corr = np.corrcoef(b_flat, alpha_flat)[0, 1] if len(b_flat) > 1 else 0
+                correlations.append(corr)
+            else:
+                correlations.append(0)
+        
+        if not steps:
+            return
+        
+        # Determine labels based on problem type
+        if has_k:
+            title = 'Geological Intelligence Evolution'
+            corr_ylabel = 'Correlation ρ(k, α)'
+            corr_title = 'Permeability-Stabilizer Correlation'
+            success_msg = '✓ Strong Geological Learning'
+        elif has_boundary:
+            title = 'Boundary Awareness Evolution'
+            corr_ylabel = 'Correlation ρ(BC, α)'
+            corr_title = 'Boundary-Stabilizer Correlation'
+            success_msg = '✓ Strong Boundary Awareness'
+        else:
+            title = 'Stabilizer Evolution'
+            corr_ylabel = 'Correlation'
+            corr_title = 'Input-Stabilizer Correlation'
+            success_msg = '✓ Learned Adaptation'
+        
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig.suptitle(title, fontsize=14, fontweight='bold')
+        
+        # Plot 1: Input-α Correlation over time
+        ax1 = axes[0, 0]
+        ax1.plot(steps, correlations, 'b-', linewidth=2, marker='o', markersize=4)
+        ax1.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+        ax1.set_xlabel('Training Step')
+        ax1.set_ylabel(corr_ylabel)
+        ax1.set_title(corr_title)
+        ax1.grid(True, alpha=0.3)
+        
+        # Add interpretation
+        final_corr = correlations[-1] if correlations else 0
+        if abs(final_corr) > 0.3:
+            ax1.text(0.98, 0.02, success_msg, transform=ax1.transAxes,
+                    fontsize=10, ha='right', va='bottom', color='green',
+                    bbox=dict(facecolor='lightgreen', alpha=0.8))
+        
+        # Plot 2: α statistics over time
+        ax2 = axes[0, 1]
+        ax2.fill_between(steps, 
+                        np.array(alpha_means) - np.array(alpha_stds),
+                        np.array(alpha_means) + np.array(alpha_stds),
+                        alpha=0.3, color='purple', label='±1σ')
+        ax2.plot(steps, alpha_means, 'purple', linewidth=2, label='Mean α')
+        ax2.set_xlabel('Training Step')
+        ax2.set_ylabel('Stabilizer α')
+        ax2.set_title('Stabilizer Statistics')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        # Plot 3: γ evolution (if available)
+        ax3 = axes[1, 0]
+        if gamma_vals:
+            ax3.plot(steps[:len(gamma_vals)], gamma_vals, 'g-', linewidth=2, marker='s', markersize=4)
+            ax3.set_xlabel('Training Step')
+            ax3.set_ylabel('Global Step Size γ')
+            ax3.set_title('Spectral Controller Evolution')
+            ax3.grid(True, alpha=0.3)
+        else:
+            ax3.text(0.5, 0.5, 'No γ data', ha='center', va='center', transform=ax3.transAxes, fontsize=12)
+            ax3.set_title('Spectral Controller (not tracked)')
+        
+        # Plot 4: Combined phase-space
+        ax4 = axes[1, 1]
+        if gamma_vals and correlations:
+            colors = np.linspace(0, 1, min(len(correlations), len(gamma_vals)))
+            scatter = ax4.scatter(correlations[:len(gamma_vals)], gamma_vals, 
+                                 c=colors, cmap='viridis', s=30, alpha=0.7)
+            ax4.set_xlabel('k-α Correlation')
+            ax4.set_ylabel('Global γ')
+            ax4.set_title('Geological Intelligence Phase Space')
+            plt.colorbar(scatter, ax=ax4, label='Training Progress')
+            ax4.grid(True, alpha=0.3)
+        else:
+            ax4.text(0.5, 0.5, 'Insufficient data', ha='center', va='center', transform=ax4.transAxes)
+        
+        plt.tight_layout()
+        plt.savefig(f'{self.report_dir}/15_pde_correlation_evolution.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        print("  ✓ 15_pde_correlation_evolution.png")
 
 
 # ============================================================
