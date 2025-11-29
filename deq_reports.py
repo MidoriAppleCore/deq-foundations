@@ -325,8 +325,190 @@ class ReportManager:
         # Save raw metrics
         self.tracker.save(f"{self.report_dir}/metrics.npz")
         
+        # Generate LLM-readable JSON checkpoint summary
+        self._save_json_checkpoint_summary()
+        generated.append("checkpoint_summary.json")
+        
         print(f"✅ Generated {len(generated)} reports in {self.report_dir}/")
         return generated
+    
+    def _save_json_checkpoint_summary(self):
+        """
+        Save a JSON summary of training checkpoints that LLMs can easily parse.
+        Includes key statistics, trends, and interpretations.
+        """
+        import json
+        
+        m = self.tracker
+        steps = np.array(m.steps) if m.steps else np.array([])
+        
+        summary = {
+            "experiment_name": self.experiment_name,
+            "report_directory": self.report_dir,
+            "total_steps": int(len(steps)),
+            "checkpoints": [],
+            "final_metrics": {},
+            "trends": {},
+            "interpretations": [],
+        }
+        
+        if len(steps) == 0:
+            with open(f"{self.report_dir}/checkpoint_summary.json", 'w') as f:
+                json.dump(summary, f, indent=2)
+            print("  ✓ checkpoint_summary.json")
+            return
+        
+        # Compute checkpoints at 0%, 25%, 50%, 75%, 100% of training
+        checkpoint_pcts = [0, 25, 50, 75, 100]
+        checkpoint_indices = [min(int(p * len(steps) / 100), len(steps)-1) for p in checkpoint_pcts]
+        
+        for pct, idx in zip(checkpoint_pcts, checkpoint_indices):
+            checkpoint = {
+                "progress_percent": pct,
+                "step": int(steps[idx]),
+                "metrics": {}
+            }
+            
+            # Add all available metrics at this checkpoint
+            for key in m.keys():
+                data = m.get(key)
+                if len(data) > idx:
+                    val = float(data[idx])
+                    checkpoint["metrics"][key] = round(val, 6)
+            
+            summary["checkpoints"].append(checkpoint)
+        
+        # Final metrics (last values)
+        for key in m.keys():
+            data = m.get(key)
+            if len(data) > 0:
+                summary["final_metrics"][key] = {
+                    "final_value": round(float(data[-1]), 6),
+                    "initial_value": round(float(data[0]), 6),
+                    "min_value": round(float(np.min(data)), 6),
+                    "max_value": round(float(np.max(data)), 6),
+                    "mean_value": round(float(np.mean(data)), 6),
+                    "std_value": round(float(np.std(data)), 6),
+                }
+        
+        # Compute trends (comparing first 10% to last 10%)
+        for key in m.keys():
+            data = np.array(m.get(key))
+            if len(data) >= 10:
+                early = data[:max(1, len(data)//10)]
+                late = data[-max(1, len(data)//10):]
+                
+                early_mean = float(np.mean(early))
+                late_mean = float(np.mean(late))
+                
+                if early_mean != 0:
+                    pct_change = ((late_mean - early_mean) / abs(early_mean)) * 100
+                else:
+                    pct_change = 0.0
+                
+                trend = "stable"
+                if pct_change < -10:
+                    trend = "decreasing"
+                elif pct_change > 10:
+                    trend = "increasing"
+                
+                summary["trends"][key] = {
+                    "early_mean": round(early_mean, 6),
+                    "late_mean": round(late_mean, 6),
+                    "percent_change": round(pct_change, 2),
+                    "trend": trend,
+                }
+        
+        # Generate interpretations
+        interpretations = []
+        
+        # Loss interpretation
+        loss_key = next((k for k in ['loss', 'lm_loss', 'task_loss', 'mse_loss'] if m.has(k)), None)
+        if loss_key and loss_key in summary["trends"]:
+            trend = summary["trends"][loss_key]
+            if trend["trend"] == "decreasing":
+                interpretations.append(f"✓ Training converging: {loss_key} decreased by {abs(trend['percent_change']):.1f}%")
+            elif trend["trend"] == "increasing":
+                interpretations.append(f"⚠ Training diverging: {loss_key} increased by {trend['percent_change']:.1f}%")
+            else:
+                interpretations.append(f"○ Training stable: {loss_key} relatively unchanged")
+        
+        # Spectral radius interpretation
+        phi_key = next((k for k in ['phi', 'phi_raw', 'spectral_radius'] if m.has(k)), None)
+        if phi_key:
+            phi_final = summary["final_metrics"].get(phi_key, {}).get("final_value", 0)
+            if 0.85 <= phi_final <= 0.98:
+                interpretations.append(f"✓ Spectral radius φ={phi_final:.3f} in optimal range [0.85, 0.98]")
+            elif phi_final < 0.85:
+                interpretations.append(f"⚠ Spectral radius φ={phi_final:.3f} below optimal (may converge too slowly)")
+            elif phi_final > 0.98:
+                interpretations.append(f"⚠ Spectral radius φ={phi_final:.3f} above optimal (stability risk)")
+        
+        # Homeostatic parameters interpretation
+        if m.has('alpha_mean'):
+            alpha = summary["final_metrics"].get("alpha_mean", {}).get("final_value", 0)
+            interpretations.append(f"○ Stabilizer α mean: {alpha:.3f} (spatial adaptation)")
+        
+        if m.has('gamma_mean'):
+            gamma = summary["final_metrics"].get("gamma_mean", {}).get("final_value", 0)
+            interpretations.append(f"○ Spectral controller γ mean: {gamma:.3f} (global step size)")
+        
+        # Validation interpretation
+        if m.val_steps:
+            val_loss_key = next((k for k in ['val_loss', 'val_mse_loss'] if m.has(k)), None)
+            if val_loss_key:
+                val_data = m.get(val_loss_key)
+                if len(val_data) >= 2:
+                    if val_data[-1] < val_data[0]:
+                        interpretations.append(f"✓ Validation improving: {val_loss_key} decreased")
+                    else:
+                        interpretations.append(f"⚠ Validation not improving: possible overfitting")
+        
+        summary["interpretations"] = interpretations
+        
+        # Add PDE-specific metrics if snapshots exist
+        if m.has_snapshots():
+            snapshots = m.get_snapshots()
+            if snapshots:
+                pde_summary = {
+                    "num_snapshots": len(snapshots),
+                    "fields_tracked": list(snapshots[0].keys()),
+                }
+                
+                # Compute correlation evolution if available
+                correlations = []
+                for snap in snapshots:
+                    if 'alpha' in snap:
+                        alpha = snap['alpha']
+                        if 'permeability' in snap:
+                            k = snap['permeability']
+                            corr = float(np.corrcoef(k.flatten(), alpha.flatten())[0, 1])
+                            correlations.append({"step": snap['step'], "k_alpha_correlation": round(corr, 4)})
+                        elif 'boundary' in snap:
+                            boundary = snap['boundary']
+                            b_flat = boundary.flatten()
+                            alpha_flat = alpha.flatten()
+                            nonzero = np.abs(b_flat) > 1e-6
+                            if nonzero.sum() > 10:
+                                corr = float(np.corrcoef(b_flat[nonzero], alpha_flat[nonzero])[0, 1])
+                            else:
+                                corr = float(np.corrcoef(b_flat, alpha_flat)[0, 1])
+                            correlations.append({"step": snap['step'], "boundary_alpha_correlation": round(corr, 4)})
+                
+                if correlations:
+                    pde_summary["correlation_evolution"] = correlations
+                    final_corr = list(correlations[-1].values())[1]  # Get the correlation value
+                    if abs(final_corr) > 0.3:
+                        interpretations.append(f"✓ Strong input-stabilizer correlation ({final_corr:.3f}): learned spatial adaptation")
+                    else:
+                        interpretations.append(f"○ Weak input-stabilizer correlation ({final_corr:.3f}): uniform adaptation")
+                
+                summary["pde_fields"] = pde_summary
+        
+        # Save JSON
+        with open(f"{self.report_dir}/checkpoint_summary.json", 'w') as f:
+            json.dump(summary, f, indent=2)
+        print("  ✓ checkpoint_summary.json")
     
     # --------------------------------------------------------
     # INDIVIDUAL PLOT GENERATORS
