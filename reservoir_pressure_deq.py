@@ -482,6 +482,7 @@ def train_ccs_multi_deq(
     lr=1e-3,
     lambda_spec=0.1,  # Stronger spectral regularization
     mixed_resolution=True,  # Train on multiple resolutions
+    report_every=5,  # Generate reports every N epochs
 ):
     """
     Train CCS DEQ with mixed-resolution strategy for generalization.
@@ -494,6 +495,10 @@ def train_ccs_multi_deq(
     print(f"\n{'='*70}")
     print(f"🌍 CCS-DEQ: CO₂ Storage Pressure Solver")
     print(f"{'='*70}")
+    
+    # Setup reporting
+    from deq_reports import create_reporter
+    tracker, reporter = create_reporter("reservoir_pressure_deq")
     
     if mixed_resolution:
         print("📐 Mixed-resolution training: 32×32 + 48×48")
@@ -517,10 +522,13 @@ def train_ccs_multi_deq(
 
     model = CCS_MultiDEQModel(hidden_ch=32, max_iter=50, tol=1e-4).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
+    
+    global_step = 0
 
     for epoch in range(1, n_epochs + 1):
         model.train()
         total_loss, total_phi, total_n, n_batches = 0.0, 0.0, 0, 0
+        epoch_alpha_mean, epoch_gamma_mean = 0.0, 0.0
 
         # Handle mixed-resolution training
         if mixed_resolution:
@@ -553,8 +561,10 @@ def train_ccs_multi_deq(
 
             if epoch <= 3:
                 loss = task_loss
+                spec_loss_val = 0.0
             else:
                 loss = task_loss + lambda_spec * spec_loss
+                spec_loss_val = (lambda_spec * spec_loss).item() if hasattr(spec_loss, 'item') else float(spec_loss)
 
             loss.backward()
             opt.step()
@@ -563,9 +573,28 @@ def train_ccs_multi_deq(
             total_phi += float(phi.detach().cpu())
             total_n += xb.size(0)
             n_batches += 1
+            
+            # Track homeostatic vars
+            epoch_alpha_mean += alpha.mean().item()
+            epoch_gamma_mean += gamma.mean().item()
+            
+            # Record step metrics
+            tracker.record(
+                step=global_step,
+                mse_loss=task_loss.item(),
+                total_loss=loss.item(),
+                phi=float(phi.detach().cpu()),
+                spectral_penalty=spec_loss_val,
+                alpha_mean=alpha.mean().item(),
+                gamma_mean=gamma.mean().item(),
+                alpha_std=alpha.std().item(),
+            )
+            global_step += 1
 
         train_loss = total_loss / total_n
         avg_phi = total_phi / max(1, n_batches)
+        avg_alpha = epoch_alpha_mean / max(1, n_batches)
+        avg_gamma = epoch_gamma_mean / max(1, n_batches)
 
         model.eval()
         val_loss, val_n = 0.0, 0
@@ -576,10 +605,21 @@ def train_ccs_multi_deq(
                 val_loss += loss.item() * xb.size(0)
                 val_n += xb.size(0)
         val_loss /= val_n
+        
+        # Record validation
+        tracker.record_val(global_step, loss=val_loss)
 
         print(f"[CCS-DEQ] Epoch {epoch:02d}/{n_epochs} | train_mse={train_loss:.4f} | "
-              f"val_mse={val_loss:.4f} | φ≈{avg_phi:.3f}")
+              f"val_mse={val_loss:.4f} | φ≈{avg_phi:.3f} | α={avg_alpha:.3f} | γ={avg_gamma:.3f}")
+        
+        # Generate intermediate reports
+        if epoch % report_every == 0:
+            reporter.generate_all()
 
+    # Final reports
+    print("\n📊 Generating final training reports...")
+    reporter.generate_all()
+    
     return model
 
 

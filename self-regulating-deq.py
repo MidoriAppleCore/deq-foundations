@@ -333,8 +333,13 @@ def train_multi_deq_pde(
     batch_size=32,
     lr=1e-3,
     lambda_spec=0.1,
+    report_every=5,  # Generate reports every N epochs
 ):
     print(f"\n=== Training 3-network DEQ PDE model on {H}x{W} ===")
+    
+    # Setup reporting
+    from deq_reports import create_reporter
+    tracker, reporter = create_reporter(f"pde_deq_{H}x{W}")
 
     train_ds = make_pde_dataset(n_train, H, W, n_iter=500, device=device, seed=0)
     val_ds = make_pde_dataset(n_val, H, W, n_iter=500, device=device, seed=1)
@@ -344,10 +349,13 @@ def train_multi_deq_pde(
 
     model = MultiDEQPDEModel(hidden_ch=32, max_iter=50, tol=1e-4).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
+    
+    global_step = 0
 
     for epoch in range(1, n_epochs + 1):
         model.train()
         total_loss, total_phi, total_n, n_batches = 0.0, 0.0, 0, 0
+        epoch_alpha_mean, epoch_gamma_mean = 0.0, 0.0
 
         for xb, yb in train_loader:
             opt.zero_grad()
@@ -371,8 +379,10 @@ def train_multi_deq_pde(
             # warmup: skip spectral penalty for first 3 epochs
             if epoch <= 3:
                 loss = task_loss
+                spec_loss_val = 0.0
             else:
                 loss = task_loss + lambda_spec * spec_loss
+                spec_loss_val = (lambda_spec * spec_loss).item() if hasattr(spec_loss, 'item') else float(spec_loss)
 
             loss.backward()
             opt.step()
@@ -381,9 +391,29 @@ def train_multi_deq_pde(
             total_phi += float(phi.detach().cpu())
             total_n += xb.size(0)
             n_batches += 1
+            
+            # Track homeostatic vars
+            epoch_alpha_mean += alpha.mean().item()
+            epoch_gamma_mean += gamma.mean().item()
+            
+            # Record step metrics
+            tracker.record(
+                step=global_step,
+                mse_loss=task_loss.item(),
+                total_loss=loss.item(),
+                phi=float(phi.detach().cpu()),
+                spectral_penalty=spec_loss_val,
+                alpha_mean=alpha.mean().item(),
+                gamma_mean=gamma.mean().item(),
+                alpha_std=alpha.std().item(),
+                gamma_std=gamma.std().item() if gamma.numel() > 1 else 0.0,
+            )
+            global_step += 1
 
         train_loss = total_loss / total_n
         avg_phi = total_phi / max(1, n_batches)
+        avg_alpha = epoch_alpha_mean / max(1, n_batches)
+        avg_gamma = epoch_gamma_mean / max(1, n_batches)
 
         # validation
         model.eval()
@@ -395,10 +425,22 @@ def train_multi_deq_pde(
                 val_loss += loss.item() * xb.size(0)
                 val_n += xb.size(0)
         val_loss /= val_n
+        
+        # Record validation
+        tracker.record_val(global_step, loss=val_loss)
 
         print(f"[3DEQ] Epoch {epoch:02d} | train_mse={train_loss:.6f} | "
-              f"val_mse={val_loss:.6f} | phi≈{avg_phi:.3f}")
+              f"val_mse={val_loss:.6f} | phi≈{avg_phi:.3f} | "
+              f"α={avg_alpha:.3f} | γ={avg_gamma:.3f}")
+        
+        # Generate intermediate reports
+        if epoch % report_every == 0:
+            reporter.generate_all()
 
+    # Final reports
+    print("\n📊 Generating final training reports...")
+    reporter.generate_all()
+    
     return model
 
 

@@ -346,24 +346,40 @@ class DEQLanguageModel(nn.Module):
 class GeometryController(nn.Module):
     """
     Geometry Controller: Now outputs 7 parameters (4 core + LR + TOL + gamma_res).
+    Takes 5 inputs: phi_eff, H, lm_loss, val_loss_gap, overfit_signal
     """
 
-    def __init__(self, hidden_dim=32):
+    def __init__(self, hidden_dim=64):  # Increased hidden dim
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(3, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 7) # Outputting 7 parameters now
+            nn.Linear(5, hidden_dim),  # 5 inputs now
+            nn.GELU(),  # GELU instead of Tanh for better gradients
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 7)  # 7 outputs
         )
 
-    def forward(self, phi_eff, H, lm_loss):
+    def forward(self, phi_eff, H, lm_loss, val_gap=None, overfit_ratio=None):
         """
         phi_eff, H, lm_loss are scalar tensors.
+        val_gap: validation_loss - train_loss (overfitting signal)
+        overfit_ratio: val_loss / train_loss (>1 means overfitting)
         Returns geometry parameters, LR, TOL, and gamma_res adjustment.
         """
-        # Build feature vector (detach for stability; controller sees stats, not gradients)
-        s = torch.stack([phi_eff.detach(), H.detach(), lm_loss.detach()], dim=0)  # (3,)
-        s = s.unsqueeze(0)  # (1,3)
+        if val_gap is None:
+            val_gap = torch.tensor(0.0, device=lm_loss.device)
+        if overfit_ratio is None:
+            overfit_ratio = torch.tensor(1.0, device=lm_loss.device)
+            
+        # Build feature vector (detach for stability)
+        s = torch.stack([
+            phi_eff.detach(), 
+            H.detach(), 
+            lm_loss.detach(),
+            val_gap.detach(),
+            overfit_ratio.detach()
+        ], dim=0)  # (5,)
+        s = s.unsqueeze(0)  # (1,5)
         out = self.mlp(s)   # (1,7)
         out = torch.tanh(out)[0]  # (7,), each in [-1,1]
 
@@ -415,10 +431,13 @@ class TrainConfig:
     tol_scale_factor: float = 0.5 
     # ------------------------------------
 
-    # Meta-loss weights (for controller ψ)
-    meta_vel_lambda: float = 1.0
-    meta_acc_lambda: float = 0.1
-    controller_l2_reg: float = 1e-5
+    # Meta-loss weights (for controller ψ) - INCREASED FOR STRONGER SIGNAL
+    meta_vel_lambda: float = 10.0  # Was 1.0 - increase for stronger gradient signal
+    meta_acc_lambda: float = 1.0   # Was 0.1 - increase for smoother learning
+    controller_l2_reg: float = 1e-6  # Was 1e-5 - reduce regularization
+    
+    # Meta-controller learning rate (separate from model)
+    meta_lr: float = 3e-3  # NEW: much higher LR for meta-network
     
     # LR Scaling Factor
     lr_scale_factor: float = 0.5
@@ -431,6 +450,10 @@ def train_phi_deq_wikitext_with_meta():
     cfg = TrainConfig()
     cfg.max_steps = 10000 
     print("Config:", cfg)
+    
+    # Setup reporting
+    from deq_reports import create_reporter
+    tracker, reporter = create_reporter("llm_deq_meta")
 
     train_loader, valid_loader, vocab_size, tokenizer = build_wikitext_dataloaders(
         seq_len=cfg.seq_len,
@@ -458,7 +481,7 @@ def train_phi_deq_wikitext_with_meta():
 
     controller_opt = torch.optim.Adam(
         controller.parameters(),
-        lr=1e-4
+        lr=cfg.meta_lr  # Use the config's meta_lr (3e-3)
     )
     
     step = 0
@@ -468,6 +491,11 @@ def train_phi_deq_wikitext_with_meta():
     # For meta-loss: store previous LM loss and velocity (as floats)
     prev_lm_loss = None
     prev_vel = 0.0
+    
+    # Track validation loss for meta-controller
+    last_val_loss = None
+    val_gap = torch.tensor(0.0, device=cfg.device)
+    overfit_ratio = torch.tensor(1.0, device=cfg.device)
     
     # Sample prompt for periodic inference
     PROMPT = "The Deep Equilibrium Model is a new type of neural network that"
@@ -512,11 +540,14 @@ def train_phi_deq_wikitext_with_meta():
 
             # ------------------------------------------------
             # Geometry controller ψ: outputs 7 core parameters (LR, TOL, gamma_res)
+            # Now also receives val_gap and overfit_ratio for generalization awareness
             # ------------------------------------------------
             d_gamma_phi, d_gamma_man, d_phi_center, d_H_min, d_lr, d_tol, d_gamma_res = controller(
                 phi_eff=phi_eff_prev, 
                 H=H_prev, 
-                lm_loss=lm_loss_prev_detached
+                lm_loss=lm_loss_prev_detached,
+                val_gap=val_gap,
+                overfit_ratio=overfit_ratio
             )
 
             # --- DYNAMIC PARAMETER CALCULATION ---
@@ -592,6 +623,7 @@ def train_phi_deq_wikitext_with_meta():
 
             # ------------------------------------------------
             # Meta-loss for ψ based on velocity / acceleration of LM loss
+            # + overfitting penalty (val_gap)
             # ------------------------------------------------
             if prev_lm_loss is None:
                 meta_loss = torch.zeros((), device=cfg.device)
@@ -605,10 +637,16 @@ def train_phi_deq_wikitext_with_meta():
                 vel = vel_t.detach().item()
                 acc = acc_t.detach().item()
 
+                # Core meta-loss: penalize increasing loss and jerky dynamics
                 meta_loss = (
                     cfg.meta_vel_lambda * F.relu(vel_t) ** 2
                     + cfg.meta_acc_lambda * (acc_t ** 2)
                 )
+                
+                # Overfitting penalty: penalize large val-train gap
+                # This encourages the controller to choose params that generalize
+                overfit_penalty = 0.5 * F.relu(val_gap) ** 2
+                meta_loss = meta_loss + overfit_penalty
 
             # Add a small regularization to controller outputs
             controller_output_reg = (
@@ -638,6 +676,32 @@ def train_phi_deq_wikitext_with_meta():
             # ------------------------------------------------
             prev_lm_loss = lm_loss.detach().item()
             prev_vel = vel
+            
+            # ------------------------------------------------
+            # Record metrics for reporting
+            # ------------------------------------------------
+            tracker.record(
+                step=step,
+                lm_loss=lm_loss.item(),
+                total_loss=total_inner_loss.item(),
+                phi_raw=phi_raw.item(),
+                phi_eff=phi_eff.item(),
+                spectral_entropy=H.item(),
+                phi_penalty=(gamma_phi * phi_pen).item(),
+                manifold_penalty=(gamma_manifold * manifold_pen).item(),
+                residual_penalty=(gamma_residual * residual_pen).item(),
+                output_penalty=output_pen_term.item(),
+                gamma_phi=gamma_phi.item(),
+                gamma_manifold=gamma_manifold.item(),
+                gamma_residual=gamma_residual.item(),
+                phi_center=phi_center.item(),
+                H_min=H_min.item(),
+                learning_rate=new_lr.item(),
+                tolerance=dynamic_tol.item(),
+                meta_loss=meta_loss.item(),
+                velocity=vel,
+                acceleration=acc,
+            )
 
             step += 1
 
@@ -680,14 +744,33 @@ def train_phi_deq_wikitext_with_meta():
 
             if step % cfg.eval_every == 0:
                 val_loss, val_ppl = evaluate()
+                
+                # Update overfitting signals for meta-controller
+                last_val_loss = val_loss
+                train_loss_avg = lm_loss.item()
+                val_gap = torch.tensor(val_loss - train_loss_avg, device=cfg.device)
+                overfit_ratio = torch.tensor(val_loss / max(train_loss_avg, 0.1), device=cfg.device)
+                
+                # Record validation metrics
+                tracker.record_val(step, loss=val_loss, ppl=val_ppl, 
+                                  val_gap=val_gap.item(), overfit_ratio=overfit_ratio.item())
+                
                 print(
                     f"  >> Eval @ step {step}: "
-                    f"Val Loss={val_loss:.4f}, Val PPL={val_ppl:.2f}"
+                    f"Val Loss={val_loss:.4f}, Val PPL={val_ppl:.2f}, "
+                    f"ValGap={val_gap.item():.3f}, OverfitRatio={overfit_ratio.item():.3f}"
                 )
+                
+                # Generate intermediate reports every 1000 steps
+                if step % 1000 == 0:
+                    reporter.generate_all()
 
             if step >= cfg.max_steps:
                 break
 
+    # Generate final reports
+    print("\n📊 Generating final training reports...")
+    reporter.generate_all()
     print("Training finished.")
 
 if __name__ == "__main__":
